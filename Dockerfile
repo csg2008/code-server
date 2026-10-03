@@ -29,6 +29,10 @@ RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
     vim-tiny \
     wget \
     zsh \
+    net-tools \
+    iputils-ping \
+    lrzsz \
+    unzip \
   && rm -f /usr/sbin/policy-rc.d \
   && git lfs install \
   && rm -rf /var/lib/apt/lists/*
@@ -124,8 +128,8 @@ ENV ENABLE_SSH=1
 # need to outlive the container.
 ENV SSHD_LOG=/var/log/sshd.log
 
-# 8080: code-server, 22: sshd.
-EXPOSE 22 8080
+# 8080: code-server, 22: sshd, ...: for other
+EXPOSE 22 8080 8081 8082 8083 8084 8085 8086 8087 8088 8089
 # This way, if someone sets $DOCKER_USER, docker-exec will still work as
 # the uid will remain the same. note: only relevant if -u isn't passed to
 # docker-run.
