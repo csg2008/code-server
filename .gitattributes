@@ -1,0 +1,7 @@
+# Shell scripts and Dockerfiles must keep LF endings. With CRLF the shebang
+# becomes `#!/bin/sh\r` (fails with "no such file or directory") and Dockerfile
+# line continuations break, both of which are easy to hit when the repo is
+# checked out on Windows with core.autocrlf=true.
+*.sh text eol=lf
+Dockerfile text eol=lf
+Dockerfile.* text eol=lf
