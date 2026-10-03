@@ -14,6 +14,7 @@ docker run --name code-server -p 8080:8080 -p 2222:22 \
 
 - 浏览器打开 <http://127.0.0.1:8080>，密码见 [code-server 登录密码](#code-server-登录密码)。
 - `ssh -p 2222 coder@localhost`，密码 `coder`。
+- 也可以直接用镜像内置的 SSH 私钥免密登录，见 [SSH 密钥登录](#ssh-密钥登录)。
 
 ## 构建镜像
 
@@ -79,9 +80,10 @@ docker run --name code-server -p 8080:8080 -p 2222:22 \
 
 ### 登录凭据
 
-| 入口 | 用户名 | 默认密码 | 运行时覆盖 |
+| 入口 | 用户名 | 默认凭据 | 运行时覆盖 |
 |---|---|---|---|
-| SSH | `coder` | `coder` | `-e SSH_USER_PASSWORD=xxx` |
+| SSH（密钥） | `coder` | `/home/coder/.ssh/id_ed25519` | —— |
+| SSH（口令） | `coder` | `coder` | `-e SSH_USER_PASSWORD=xxx` |
 | SSH | `root` | 不可登录 | —— |
 | code-server (8080) | 不适用 | 见下方说明 | 改 `~/.config/code-server/config.yaml` |
 
@@ -96,6 +98,106 @@ docker logs code-server | grep -i password
 ```
 
 未挂载 `~/.config` 时，容器重建后该密码会重新随机生成。
+
+### SSH 密钥登录
+
+镜像在构建时就为 `coder` 生成了一对 ed25519 密钥，并把公钥装进了 `authorized_keys`，所以**密钥登录开箱可用**，无需任何额外配置 —— 见下方「内置密钥」。如果你要用自己的密钥替换它，或想关掉口令登录，见做法 1–3，它们都基于同一个事实：sshd 由 entrypoint 在**容器启动时**拉起并读取配置，所以改动运行时可见的文件即可生效，不必重建镜像。
+
+#### 内置密钥（默认，开箱可用）
+
+私钥在容器内的 `/home/coder/.ssh/id_ed25519`，取出来用即可：
+
+```bash
+docker cp code-server:/home/coder/.ssh/id_ed25519 ./id_ed25519
+chmod 600 ./id_ed25519
+ssh -i ./id_ed25519 -p 2222 coder@localhost
+```
+
+也可以从镜像里取（不必先启动容器）：
+
+```bash
+docker create --name tmp-key code-server-ssh
+docker cp tmp-key:/home/coder/.ssh/id_ed25519 ./id_ed25519
+docker rm tmp-key
+```
+
+几点需要清楚：
+
+- 私钥**没有口令**（构建期无人交互，`ssh-keygen -N ''`）。请相应地保管导出的文件。
+- 私钥是**烘进镜像**的：所有基于该镜像构建的容器共用同一把，任何能拉到镜像的人都能登录。这与本镜像的整体假设一致（它本来就内置了已知口令、`coder` 还有免密 sudo），但它不是秘密，也不能被当作访问控制手段。介意的话按做法 3 换成自己的密钥，或在部署时重新生成。
+- 公钥同时留在 `/home/coder/.ssh/id_ed25519.pub`，方便你核对指纹。
+- 这把密钥与 root 无关：`PermitRootLogin no` 依然生效，`root` 用任何方式都无法登录 SSH。
+
+#### 做法 1：挂载公钥（不改镜像，口令登录仍保留）
+
+```bash
+ssh-keygen -t ed25519          # 本地还没有密钥时
+docker run --name code-server -p 8080:8080 -p 2222:22 \
+  -v "$HOME/.ssh/id_ed25519.pub:/home/coder/.ssh/authorized_keys:ro" \
+  -v "$PWD:/home/coder/project" code-server-ssh
+```
+
+`ssh -p 2222 coder@localhost` 即可免密进入。此时 `PasswordAuthentication` 仍是 `yes`，口令登录与密钥登录并存 —— 适合先验证密钥可用、再考虑收紧。
+
+两点说明：
+
+- 容器内路径固定为 `/home/coder/.ssh/authorized_keys`，与 sshd `AuthorizedKeysFile` 的默认值一致。即使传了 `DOCKER_USER` 改名，家目录仍然是 `/home/coder`，路径不用跟着变。
+- 宿主文件不存在时 Docker 会以 root 身份补建 `/home/coder/.ssh`（权限 755）。sshd 的 `StrictModes` 只拒绝 group/other **可写**的目录和文件，755 的目录加 644 的文件可以通过，因此这里不需要额外修正属主。
+
+#### 做法 2：只允许密钥，关闭口令登录（不改镜像）
+
+把一份完整的 sshd 配置以只读方式挂进容器，整体替换镜像里的 drop-in：
+
+```bash
+printf 'PermitRootLogin no\nPasswordAuthentication no\nPubkeyAuthentication yes\n' \
+  > sshd-code-server.conf
+
+docker run --name code-server -p 8080:8080 -p 2222:22 \
+  -v "$PWD/sshd-code-server.conf:/etc/ssh/sshd_config.d/99-code-server.conf:ro" \
+  -v "$HOME/.ssh/id_ed25519.pub:/home/coder/.ssh/authorized_keys:ro" \
+  -v "$PWD:/home/coder/project" code-server-ssh
+```
+
+注意这是**整体替换**而非追加，所以要写全你想保留的设置（上面连同 `PermitRootLogin no` 一起写了）。
+
+⚠️ 操作顺序很重要：先按做法 1 确认密钥能登录，再关闭 `PasswordAuthentication`。一旦关错了，容器重建后就只能靠 `docker exec` 进去救场。
+
+#### 做法 3：构建期固化公钥（需要改 Dockerfile）
+
+适合把镜像分发给团队、不希望每人各自挂载的场景。在 `adduser` 那一步之后加入：
+
+```dockerfile
+ARG AUTHORIZED_KEYS=""
+RUN if [ -n "$AUTHORIZED_KEYS" ]; then \
+      mkdir -p /home/coder/.ssh \
+      && chmod 700 /home/coder/.ssh \
+      && printf '%s\n' "$AUTHORIZED_KEYS" > /home/coder/.ssh/authorized_keys \
+      && chmod 600 /home/coder/.ssh/authorized_keys \
+      && chown -R coder:coder /home/coder/.ssh; \
+    fi
+```
+
+```bash
+docker build -t code-server-ssh \
+  --build-arg AUTHORIZED_KEYS="$(cat ~/.ssh/id_ed25519.pub)" .
+```
+
+多个公钥用 `\n` 连接即可。`AUTHORIZED_KEYS` 为空时该步骤整体跳过，不会留下空文件。
+
+#### 密钥登录仍然失败时
+
+先按顺序核对权限，`StrictModes` 对不合规的密钥是**静默拒绝**的，客户端只会看到 `Permission denied (publickey)`：
+
+| 路径 | 权限 |
+|---|---|
+| `~/.ssh` | `700` |
+| `~/.ssh/authorized_keys` | `600` 或 `644`，且 group/other 不可写 |
+
+具体拒绝原因在 `/var/log/sshd.log` 里：
+
+```bash
+docker exec code-server tail -50 /var/log/sshd.log
+```
 
 ### 用户与权限
 
@@ -143,8 +245,9 @@ docker run ... -v "$PWD/entrypoint.d:/home/coder/entrypoint.d" code-server-ssh
 **这个镜像的默认配置是按"内网、不考虑安全"的口径设定的**，具体包括：
 
 - `coder` 有预置的**弱口令**，且可通过构建参数固化进镜像；
-- sshd 启用了 `PasswordAuthentication yes`（`/etc/ssh/sshd_config.d/99-code-server.conf`），口令登录即可进入；
-- `coder` 拥有免密 sudo，**一旦口令被猜出就等于拿到 root** —— 禁止 root 直接登录并不改变这一点；
+- `coder` 的 SSH **私钥同样固化在镜像里**，无口令，任何能拉取镜像的人都持有它；
+- sshd 启用了 `PubkeyAuthentication yes` 与 `PasswordAuthentication yes`（`/etc/ssh/sshd_config.d/99-code-server.conf`），两条路径都能进入；
+- `coder` 拥有免密 sudo，**一旦口令或私钥泄漏就等于拿到 root** —— 禁止 root 直接登录并不改变这一点；
 - 同时暴露 SSH 和 HTTP 两个入口。
 
 因此：**不要把它发布到公网，也不要把 22 端口映射到公网可达的地址。**
@@ -156,7 +259,7 @@ docker run ... -v "$PWD/entrypoint.d:/home/coder/entrypoint.d" code-server-ssh
 1. **关闭 SSH**：`-e ENABLE_SSH=0`，只用 code-server。
 2. **换掉默认密码**：`--build-arg CODER_PASSWORD` 或运行时的 `SSH_USER_PASSWORD`。
 3. **只绑本机**：`-p 127.0.0.1:8080:8080 -p 127.0.0.1:2222:22`，避免监听所有网卡。
-4. **改用密钥登录**：把 `/etc/ssh/sshd_config.d/99-code-server.conf` 里的 `PasswordAuthentication` 改为 `no`，并在构建期把公钥写入目标用户的 `~/.ssh/authorized_keys`（注意 `authorized_keys` 路径在 `DOCKER_USER` 改名后仍为 `/home/coder/.ssh`）。
+4. **改用密钥登录**：见 [SSH 密钥登录](#ssh-密钥登录)。其中做法 2 无需重建镜像就能关掉口令登录。
 5. **收掉免密 sudo**：删除 `Dockerfile` 中写入 `/etc/sudoers.d/nopasswd` 的那一行（会影响 `entrypoint.sh` 里启动 sshd 的方式，需同步调整）。
 6. **恢复 root SSH 登录**（不建议）：把 `/etc/ssh/sshd_config.d/99-code-server.conf` 里的 `PermitRootLogin` 改回 `yes`。镜像同时做了 `passwd -l root`，所以密码登录还需要再执行 `passwd root` 设一个口令；若走密钥登录，则配上 `authorized_keys` 即可，无需口令。
 

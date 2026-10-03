@@ -52,11 +52,12 @@ RUN rm -f /etc/profile.d/80-systemd-osc-context.sh \
 # wording is not stable across OpenSSH releases. Include directives are read
 # first, so this wins over the defaults further down the file.
 #
-# Root cannot log in over SSH -- log in as coder and use its passwordless sudo.
-# passwd -l keeps the root account passwordless as well, so the setting cannot
-# be undone by a stray edit to PermitRootLogin alone.
+# coder may log in with either the key pair generated below or its password.
+# Root cannot log in at all -- use coder's passwordless sudo instead. passwd -l
+# keeps the root account passwordless too, so the setting cannot be undone by a
+# stray edit to PermitRootLogin alone.
 RUN mkdir -p /etc/ssh/sshd_config.d \
-  && printf 'PermitRootLogin no\nPasswordAuthentication yes\n' \
+  && printf 'PermitRootLogin no\nPubkeyAuthentication yes\nPasswordAuthentication yes\n' \
        > /etc/ssh/sshd_config.d/99-code-server.conf \
   && passwd -l root \
   && touch /var/log/sshd.log \
@@ -76,6 +77,23 @@ RUN if grep -q 1000 /etc/passwd; then \
   && adduser --gecos '' --disabled-password coder \
   && echo "coder:$CODER_PASSWORD" | chpasswd \
   && echo "coder ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/nopasswd
+
+# Key pair for coder, generated at build time with an empty passphrase (it has
+# to work unattended) and installed as coder's own authorized key.
+#
+# This private key is baked into the image: every container built from it shares
+# the same one, and anyone who can pull the image can log in with it. That fits
+# the trusted-internal-network assumption the rest of this image is built on --
+# it already ships a known password -- but it is not a secret and must not be
+# relied on to keep anyone out. Regenerate per deployment if that matters.
+RUN mkdir -p /home/coder/.ssh \
+  && ssh-keygen -t ed25519 -N '' -C coder@code-server \
+       -f /home/coder/.ssh/id_ed25519 \
+  && cp /home/coder/.ssh/id_ed25519.pub /home/coder/.ssh/authorized_keys \
+  && chmod 700 /home/coder/.ssh \
+  && chmod 600 /home/coder/.ssh/id_ed25519 /home/coder/.ssh/authorized_keys \
+  && chmod 644 /home/coder/.ssh/id_ed25519.pub \
+  && chown -R coder:coder /home/coder/.ssh
 
 RUN ARCH="$(dpkg --print-architecture)" \
   && curl -fsSL "https://github.com/boxboat/fixuid/releases/download/v0.6.0/fixuid-0.6.0-linux-$ARCH.tar.gz" | tar -C /usr/local/bin -xzf - \
